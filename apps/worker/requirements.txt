@@ -1,0 +1,4 @@
+requests
+psycopg[binary]
+kafka-python
+redis
