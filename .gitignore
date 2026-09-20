@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.py[cod]
+.venv/
+models/*.pkl
+models/*.joblib
+models/*.json
+data/source/
+data/raw/
+data/processed/
+*.log
+.pytest_cache/
+node_modules/
+dist/
