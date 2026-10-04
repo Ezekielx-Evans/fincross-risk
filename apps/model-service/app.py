@@ -1,7 +1,7 @@
+import math
 import os
 from pathlib import Path
 
-# 加载模型，创建接口并返回 HTTP 错误
 import joblib
 from fastapi import FastAPI, HTTPException
 
@@ -50,12 +50,18 @@ def predict(payload: dict):
         raise HTTPException(status_code=400, detail={"missing": missing})
 
     # 按训练时的顺序取值并转为浮点数，外层列表表示一批交易
-    row = [[float(payload[name]) for name in FEATURE_NAMES]]
+    try:
+        values = [float(payload[name]) for name in FEATURE_NAMES]
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPException(status_code=422, detail="features must be finite numbers")
+    if not all(math.isfinite(value) for value in values):
+        raise HTTPException(status_code=422, detail="features must be finite numbers")
+    row = [values]
 
     # 计算概率；[0] 取第一笔交易，[1] 取风险类别的概率
     probability = float(model.predict_proba(row)[0][1])
 
-    # 根据风险概率设定风险等级
+    # 将风险概率分为高、中、低风险
     risk_level = "HIGH" if probability >= 0.70 else "MEDIUM" if probability >= 0.30 else "LOW"
 
     # 返回概率、等级和版本；数据库写回由 Worker 负责

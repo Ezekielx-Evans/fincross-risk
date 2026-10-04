@@ -1,78 +1,87 @@
-# 1. 导入依赖：标准库负责 JSON、特征计算和环境配置。
 import json
 import math
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
-# 第三方库分别负责数据库访问、HTTP 接口、Kafka 消息和请求校验。
 import psycopg
 from fastapi import FastAPI, HTTPException
 from kafka import KafkaProducer
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-# 2. 读取连接配置：数据库地址必填，Kafka 地址和主题提供默认值。
+# 配置 PostgreSQL 和 Kafka。
 DATABASE_URL = os.environ["DATABASE_URL"]
 KAFKA_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:19092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "transaction-analysis")
 
-# 支付方式编码需与训练脚本一致，避免训练与在线推理使用不同含义。
+# 支付方式编码，与训练脚本保持一致。
 PAYMENT_FORMAT_CODES = {
     "ACH": 1,
     "CREDIT CARD": 2,
     "CHEQUE": 3,
     "CASH": 4,
     "WIRE": 5,
+    "REINVESTMENT": 6,
+    "BITCOIN": 7,
 }
 
-# 3. 创建接口应用和可复用的 Kafka 生产者。
+# 创建 FastAPI 应用。
 app = FastAPI(title="fincross-risk Data Service")
+
+# 创建 Kafka 生产者。
 producer = KafkaProducer(
     bootstrap_servers=KAFKA_SERVERS,
-    # 将任务字典序列化为 JSON 字节，供 Worker 读取。
+    # 将任务序列化为 JSON 字节。
     value_serializer=lambda value: json.dumps(value).encode("utf-8"),
 )
 
-# 4. 定义交易请求：Pydantic 校验必填字段和类型，不符合要求时返回 422。
+# 定义交易请求模型。
 class TransactionIn(BaseModel):
-    # 业务交易编号和时间；external_id 用于去重与结果查询。
-    external_id: str
+    # 文本去除两端空格；长度和金额范围与数据库约束保持一致。
+    model_config = ConfigDict(str_strip_whitespace=True)
+    external_id: str = Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_.-]+$")
     transaction_timestamp: datetime
-    # 付款方与收款方的银行、账户信息。
-    from_bank: str
-    from_account: str
-    to_bank: str
-    to_account: str
-    # 收付金额、币种与支付方式，用于保存交易和生成特征。
-    amount_received: float
-    receiving_currency: str
-    amount_paid: float
-    payment_currency: str
-    payment_format: str
-    # 离线数据有标签；在线预测请求通常没有真实标签。
+    from_bank: str = Field(min_length=1, max_length=32)
+    from_account: str = Field(min_length=1, max_length=64)
+    to_bank: str = Field(min_length=1, max_length=32)
+    to_account: str = Field(min_length=1, max_length=64)
+    amount_received: float = Field(ge=0, lt=1e18, allow_inf_nan=False)
+    receiving_currency: str = Field(min_length=1, max_length=32)
+    amount_paid: float = Field(ge=0, lt=1e18, allow_inf_nan=False)
+    payment_currency: str = Field(min_length=1, max_length=32)
+    payment_format: str = Field(min_length=1, max_length=32)
+    # 可选的真实标签不参与特征计算。
     is_laundering: bool | None = None
 
-# 5. 创建数据库连接：由调用处的 with 管理事务及连接关闭。
+    @field_validator("transaction_timestamp")
+    @classmethod
+    def normalize_timestamp(cls, value: datetime) -> datetime:
+        # 无时区时间按 UTC 处理，带时区时间转换为 UTC，与离线特征一致。
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+# 创建数据库连接。
 def db():
     return psycopg.connect(DATABASE_URL)
 
-# 统一支付方式的大小写和首尾空格，未知方式编码为 0。
+# 将支付方式转换为数值编码，未知方式记为 0。
 def payment_format_code(value: str) -> float:
     return float(PAYMENT_FORMAT_CODES.get(value.strip().upper(), 0))
 
-# 6. 生成 9 项模型特征，不将账户编号或真实标签作为预测输入。
+# 生成交易特征。
 def make_features(item: TransactionIn) -> dict:
-    # 提取小时和星期；星期一为 0，星期日为 6。
+    # 时间已在请求校验时统一为 UTC，再提取小时和星期。
     hour = item.transaction_timestamp.hour
     weekday = item.transaction_timestamp.weekday()
     return {
-        # 保留原始金额，并用 log1p 压缩大额数值；取对数前将负值截为 0。
+        # 保留原始金额，并计算非负金额的对数特征。
         "amount_paid": float(item.amount_paid),
         "amount_received": float(item.amount_received),
         "amount_paid_log": math.log1p(max(item.amount_paid, 0.0)),
         "amount_received_log": math.log1p(max(item.amount_received, 0.0)),
         "hour": float(hour),
         "weekday": float(weekday),
-        # 银行或币种不同记为 1，否则为 0；不直接代表跨国交易。
+        # 生成跨行和跨币种标记。
         "cross_bank_flag": float(item.from_bank != item.to_bank),
         "cross_currency_flag": float(
             item.payment_currency.strip().upper()
@@ -81,21 +90,22 @@ def make_features(item: TransactionIn) -> dict:
         "payment_format_code": payment_format_code(item.payment_format),
     }
 
-# 7. 健康检查：执行简单 SQL，确认服务能连接并访问数据库。
+# Data Service 健康检查。
 @app.get("/health")
 def health():
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT 1")
-            cur.fetchone()
+            # 检查连接和业务表，避免数据库可连接但尚未初始化。
+            cur.execute("SELECT to_regclass('public.transactions'), to_regclass('public.predictions')")
+            if any(name is None for name in cur.fetchone()):
+                raise HTTPException(status_code=503, detail="database tables are not ready")
     return {"service": "data-service", "status": "ok"}
 
-# 8. 提交交易：生成特征 → 保存交易 → 发布任务 → 更新状态。
+# 提交交易。
 @app.post("/transactions")
 def create_transaction(item: TransactionIn):
-    # 先生成特征，避免特征计算失败后仍留下待处理交易。
     features = make_features(item)
-    # 先写入 RECEIVED 状态；%s 参数与 SQL 分开传入，不拼接用户输入。
+    # 保存交易，初始状态为 RECEIVED。
     try:
         with db() as conn:
             with conn.cursor() as cur:
@@ -123,44 +133,45 @@ def create_transaction(item: TransactionIn):
                         item.is_laundering,
                     ),
                 )
-                # 获取数据库内部编号，并在发布 Kafka 任务前提交交易。
+                # 获取内部交易编号并提交事务。
                 transaction_id = cur.fetchone()[0]
                 conn.commit()
     except psycopg.errors.UniqueViolation:
-        # 重复的业务交易编号返回 409，不再发布任务。
+        # 交易编号重复时返回 409。
         raise HTTPException(status_code=409, detail="external_id already exists")
 
-    # 消息携带内部编号、业务编号和特征，供 Worker 推理并写回结果。
+    # 组装交易分析任务。
     message = {
         "transaction_id": transaction_id,
         "external_id": item.external_id,
         "features": features,
     }
-    # 等待 Kafka 确认消息发送；失败返回 503，已保存的交易仍为 RECEIVED。
     try:
+        # 发布任务并等待 Kafka 确认。
         producer.send(KAFKA_TOPIC, message).get(timeout=10)
     except Exception as exc:
+        # Kafka 发布失败时返回 503。
         raise HTTPException(status_code=503, detail=f"kafka publish failed: {exc}")
 
-    # 发布成功后标为 QUEUED；仅更新 RECEIVED，避免覆盖 Worker 已写入的 SCORED。
+    # 将 RECEIVED 更新为 QUEUED，避免覆盖已完成状态。
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE transactions SET status='QUEUED' WHERE id=%s AND status='RECEIVED'",
+                "UPDATE transactions SET status='QUEUED', updated_at=NOW() WHERE id=%s AND status='RECEIVED'",
                 (transaction_id,),
             )
             conn.commit()
-    # 返回任务受理信息，不代表模型已处理完成；最终状态需调用查询接口。
+    # 返回任务受理信息。
     return {
         "external_id": item.external_id,
         "transaction_id": transaction_id,
         "status": "QUEUED",
     }
 
-# 9. 查询交易：按业务编号读取交易及最新一次预测结果。
+# 查询交易。
 @app.get("/transactions/{external_id}")
 def get_transaction(external_id: str):
-    # LEFT JOIN 保留尚无预测的交易；LATERAL 子查询只取最新一条预测。
+    # 查询交易和最新预测，尚未预测的交易也保留。
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -181,10 +192,10 @@ def get_transaction(external_id: str):
                 (external_id,),
             )
             row = cur.fetchone()
-    # 未找到交易返回 404；尚未预测的交易仍正常返回，预测字段为 null。
     if row is None:
+        # 交易不存在时返回 404。
         raise HTTPException(status_code=404, detail="transaction not found")
-    # 字段名与 SELECT 顺序一一对应，将查询元组转换为响应字典。
+    # 按查询字段顺序组装响应字典。
     keys = [
         "external_id", "transaction_timestamp", "from_bank", "from_account",
         "to_bank", "to_account", "amount_received", "receiving_currency",

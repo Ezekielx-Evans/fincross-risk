@@ -1,122 +1,135 @@
 import json
 import os
-import time
 
 import psycopg
 import redis
 import requests
 from kafka import KafkaConsumer
+from kafka.structs import OffsetAndMetadata, TopicPartition
 
-
-# 读取数据库、Redis、Kafka 和模型服务的连接配置。
+# 从环境变量读取连接配置；默认主机名对应 Compose 中的服务名。
+# DATABASE_URL 必须配置，其余连接参数提供默认值。
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 KAFKA_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:19092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "transaction-analysis")
 MODEL_SERVICE_URL = os.getenv("MODEL_SERVICE_URL", "http://model-service:8000")
 
+# 创建 Redis 客户端，设置连接和读取超时，故障时回退到数据库。
+redis_client = redis.from_url(
+    REDIS_URL, decode_responses=True,
+    socket_connect_timeout=2, socket_timeout=2,
+)
 
-# 创建 Redis 客户端，将读取的内容解码为字符串。
-redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-
-
-# 创建 PostgreSQL 连接。
 def db():
+    # 建立数据库连接，交给调用处的 with 语句管理关闭。
     return psycopg.connect(DATABASE_URL)
 
+def cache_completed(done_key):
+    # 仅在数据库确认完成后调用；标记保留 24 小时。
+    try:
+        redis_client.set(done_key, "1", ex=86400)
+    except redis.RedisError as exc:
+        # 缓存故障不影响已保存的结果，也不阻止提交消费进度。
+        print(f"completion cache write unavailable: {exc}", flush=True)
 
-# 处理一条交易分析任务。
 def process_message(message):
-    # 读取业务交易编号和数据库内部编号。
+    # 消息已解析为字典；external_id 是业务编号，transaction_id 是数据库主键。
     payload = message.value
     external_id = payload["external_id"]
     transaction_id = int(payload["transaction_id"])
+    # 同时使用数据库主键和业务编号；v2 命名空间不读取旧版完成标记。
+    done_key = f"fincross:completion:v2:{transaction_id}:{external_id}"
 
-    # 使用业务交易编号生成 Redis 完成标记的键名。
-    done_key = f"fincross:transaction:{external_id}:done"
+    # 命中已完成标记时直接跳过，不再查询数据库和调用模型。
+    try:
+        if redis_client.get(done_key) == "1":
+            print(f"skip cached transaction external_id={external_id}", flush=True)
+            return
+    except redis.RedisError as exc:
+        # 缓存不可用时继续查库，不能据此认定交易尚未处理。
+        print(f"completion cache read unavailable: {exc}", flush=True)
 
-    # 已有完成标记时跳过预测和数据库写入。
-    if redis_client.exists(done_key):
-        print(f"skip duplicated message external_id={external_id}", flush=True)
+    # 标记过期、缺失或缓存故障时，以数据库状态确认是否完成。
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM transactions WHERE id=%s", (transaction_id,))
+            row = cur.fetchone()
+    # 交易不存在时终止处理；已完成的交易直接跳过，避免重复调用模型。
+    if row is None:
+        raise ValueError(f"transaction not found: {transaction_id}")
+    if row[0] == "SCORED":
+        # 数据库已确认完成，补写缓存以便后续重复消息直接跳过。
+        cache_completed(done_key)
+        print(f"skip completed transaction external_id={external_id}", flush=True)
         return
 
-    # 将任务中的九个特征发送给模型服务，等待预测结果。
+    # 将交易特征作为 JSON 发送到模型接口，连接和读取超时均设为 15 秒。
     response = requests.post(
         f"{MODEL_SERVICE_URL}/predict",
         json=payload["features"],
         timeout=15,
     )
-
-    # HTTP 请求失败时抛出异常，成功时读取 JSON 结果。
+    # HTTP 4xx/5xx 响应抛出异常；成功后读取概率、等级和模型版本。
     response.raise_for_status()
     result = response.json()
 
-    # 在同一个事务中保存预测结果并更新交易状态。
+    # 预测结果和交易状态在同一事务中写入，任一步失败都会回滚。
     with db() as conn:
         with conn.cursor() as cur:
-            # 将模型版本、风险概率和风险等级写入预测表。
+            # 同一交易、同一模型版本已有预测时，不再重复插入。
             cur.execute(
                 """INSERT INTO predictions
                    (transaction_id, model_version, risk_probability, risk_level)
-                   VALUES (%s,%s,%s,%s)""",
+                   VALUES (%s,%s,%s,%s)
+                   ON CONFLICT (transaction_id, model_version) DO NOTHING""",
                 (transaction_id, result["model_version"],
                  result["risk_probability"], result["risk_level"]),
             )
-
-            # 将交易标记为已完成评分。
+            # 将交易标记为已评分，同时更新处理时间。
             cur.execute(
-                "UPDATE transactions SET status='SCORED' WHERE id=%s",
+                "UPDATE transactions SET status='SCORED', updated_at=NOW() WHERE id=%s",
                 (transaction_id,),
             )
-
-        # 两项写入均成功后提交事务；发生异常则回滚。
+        # 两项写入均成功后提交，确保状态与预测结果一致。
         conn.commit()
 
-    # 数据库提交成功后保存完成标记，有效期为一天。
-    redis_client.set(done_key, "1", ex=86400)
-
-    # 输出处理结果，flush=True 让容器日志及时显示。
+    # 必须先提交数据库，再写完成标记，避免未落库的任务被提前跳过。
+    cache_completed(done_key)
+    # 输出交易编号与风险概率，并立即刷新日志。
     print(
         f"scored external_id={external_id} "
         f"probability={result['risk_probability']:.6f}",
         flush=True,
     )
 
-
-# 启动消费者，持续读取 Kafka 任务。
 def main():
+    # 订阅交易分析主题，持续接收待评分的交易任务。
     consumer = KafkaConsumer(
-        # 订阅 Data Service 发布任务的主题。
         KAFKA_TOPIC,
         bootstrap_servers=KAFKA_SERVERS,
-
-        # 同一消费组的 Worker 按分区分担任务。
+        # 同一消费组内的多个 Worker 可以分担不同分区。
         group_id="fincross-risk-worker",
-
-        # 关闭自动提交，由代码在处理成功后提交进度。
+        # 关闭自动提交，待业务处理成功后再记录消费进度。
         enable_auto_commit=False,
-
-        # 没有有效消费进度时，从仍保留的最早消息开始读取。
+        # 没有有效的已提交位点时，从分区中最早保留的消息开始读取。
         auto_offset_reset="earliest",
-
-        # 将消息中的 JSON 字节解码为 Python 字典。
+        # 将消息的 UTF-8 字节解码，再把 JSON 解析为 Python 字典。
         value_deserializer=lambda value: json.loads(value.decode("utf-8")),
     )
     print("worker started", flush=True)
-
-    # 逐条处理收到的消息。
-    for message in consumer:
-        try:
+    try:
+        for message in consumer:
+            # 按顺序处理消息；异常向外抛出并退出，当前消息不提交消费进度。
             process_message(message)
+            # offset 表示消息在分区中的位置；提交值为下次应读取的位置。
+            # 只更新当前分区，避免提交其他分区尚未处理的消息。
+            partition = TopicPartition(message.topic, message.partition)
+            consumer.commit({partition: OffsetAndMetadata(message.offset + 1, "")})
+    finally:
+        # 不在关闭时提交未处理消息；Compose 会重启异常退出的 Worker。
+        consumer.close(autocommit=False)
 
-            # 处理完成后提交消费进度，供后续恢复消费使用。
-            consumer.commit()
-        except Exception as exc:
-            # 记录错误并等待三秒；此处不会自动重试当前消息。
-            print(f"processing failed: {exc}", flush=True)
-            time.sleep(3)
-
-
-# 直接运行 worker.py 时启动消费循环。
+# 直接运行脚本时启动消费循环。
 if __name__ == "__main__":
     main()
