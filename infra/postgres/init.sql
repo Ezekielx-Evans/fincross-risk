@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS experiment_runs (
     dataset_reference TEXT,
     feature_version VARCHAR(64),
     random_seed INTEGER,
-    -- 保存 Precision、Recall、F1、ROC-AUC、PR-AUC 等指标。
+    -- 保存 Precision、Recall、F2、ROC-AUC、PR-AUC 等指标。
     metrics JSONB NOT NULL,
     -- 实验记录写入时间。
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()

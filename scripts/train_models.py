@@ -2,10 +2,13 @@ import argparse
 import hashlib
 import json
 import platform
+import shutil
 from importlib.metadata import version
 from pathlib import Path
 
 import joblib
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -13,7 +16,7 @@ import pyarrow.parquet as pq
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
-    average_precision_score, f1_score, precision_score,
+    average_precision_score, fbeta_score, precision_score,
     recall_score, roc_auc_score, precision_recall_curve,
 )
 from sklearn.pipeline import make_pipeline
@@ -36,9 +39,11 @@ PERIOD_END = pd.Timestamp("2022-09-11", tz="UTC")
 # 每批读取十万笔，固定随机种子用于模型参数和结果复现。
 BATCH_SIZE = 100_000
 SEED = 42
-# 先比较这些树数；XGBoost 搜索到指定轮数为止。
+# F2 中 Recall 的权重高于 Precision，用于优先减少风险交易漏报。
+F_BETA = 2.0
+# 随机森林的默认候选树数。
 RF_COUNTS = [50, 100, 150, 200, 300]
-XGB_MAX_ROUNDS = 300
+DEFAULT_ROUNDS = {"logistic-regression": 500, "random-forest": 300, "xgboost": 500}
 
 
 # 分批读取数据，保留主要交易时段内的全部记录，并记录筛选数量。
@@ -126,7 +131,7 @@ def split_by_time(df, check_test=False):
 # 使用验证集选出的阈值计算分类指标，并记录概率评估指标。
 def metrics(y_true, y_prob, threshold):
     # 概率达到阈值记为风险，否则记为正常。
-    # 阈值影响 Precision、Recall 和 F1，不影响 AP、ROC-AUC 或原始概率。
+    # 阈值影响 Precision、Recall 和 F2，不影响 AP、ROC-AUC 或原始概率。
     y_pred = (y_prob >= threshold).astype(int)
     return {
         # 记录这组分类指标使用的阈值。
@@ -137,8 +142,8 @@ def metrics(y_true, y_prob, threshold):
         "precision": float(precision_score(y_true, y_pred, zero_division=0)),
         # Recall：实际风险交易中，被识别出来的比例。
         "recall": float(recall_score(y_true, y_pred, zero_division=0)),
-        # F1：综合 Precision 和 Recall；无法计算时返回 0。
-        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        # F2：让 Recall 的权重高于 Precision；无法计算时返回 0。
+        "f2": float(fbeta_score(y_true, y_pred, beta=F_BETA, zero_division=0)),
         # ROC-AUC 和 AP 直接使用概率，评估不同阈值下的区分能力。
         "roc_auc": float(roc_auc_score(y_true, y_prob)),
         # 沿用 pr_auc 字段名，实际保存的是 Average Precision（AP）。
@@ -146,7 +151,7 @@ def metrics(y_true, y_prob, threshold):
     }
 
 
-# 仅使用验证集，为已选中的模型寻找 F1 最高的阈值。
+# 仅使用验证集，为已选中的模型寻找 F2 最高的阈值。
 def select_threshold(y_true, y_prob):
     y_true = np.asarray(y_true)
     y_prob = np.asarray(y_prob, dtype=float)
@@ -160,14 +165,17 @@ def select_threshold(y_true, y_prob):
 
     # 按各个不同的预测概率计算 P、R，同分交易使用同一个阈值。
     precision, recall, thresholds = precision_recall_curve(y_true, y_prob)
-    # 最后一组 P、R 没有对应阈值，去掉后再计算各阈值的 F1。
+    # 最后一组 P、R 没有对应阈值，去掉后再计算各阈值的 F2。
     precision = precision[:-1]
     recall = recall[:-1]
+    beta_squared = F_BETA ** 2
     scores = np.divide(
-        2 * precision * recall, precision + recall,
-        out=np.zeros_like(precision), where=(precision + recall) > 0,
+        (1 + beta_squared) * precision * recall,
+        beta_squared * precision + recall,
+        out=np.zeros_like(precision),
+        where=(beta_squared * precision + recall) > 0,
     )
-    # thresholds 从小到大排列；F1 并列最高时选较高阈值，固定选择规则。
+    # thresholds 从小到大排列；F2 并列最高时选较高阈值，固定选择规则。
     best_index = np.flatnonzero(scores == scores.max())[-1]
     return float(thresholds[best_index]), int(len(thresholds))
 
@@ -177,240 +185,285 @@ def validation_ap(y_true, y_prob):
     return average_precision_score(y_true, y_prob)
 
 
-# 左图比较随机森林候选树数，右图展示 XGBoost 每一轮的 AP。
-def plot_validation_ap(search, best_by_family):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), sharey=True)
-    baseline = best_by_family["logistic-regression"]["pr_auc"]
-    for ax, name, label in [
-        (axes[0], "random-forest", "Random forest"),
-        (axes[1], "xgboost", "XGBoost"),
-    ]:
-        xs = [item["n_estimators"] for item in search[name]]
-        ys = [item["pr_auc"] for item in search[name]]
+# 根据数据范围缩放纵轴，并允许命令行指定范围。
+def set_score_axis(ax, values, y_min=None, y_max=None):
+    values = np.asarray(values, dtype=float)
+    if values.size == 0 or not np.isfinite(values).all():
+        raise ValueError("绘图指标为空或包含无效数值")
+    spread = float(values.max() - values.min())
+    padding = max(spread * 0.1, 0.001)
+    lower = (max(0.0, float(values.min()) - padding) if y_max is None else 0.0) if y_min is None else y_min
+    upper = (min(1.0, float(values.max()) + padding) if y_min is None else 1.0) if y_max is None else y_max
+    if not 0 <= lower < upper <= 1:
+        raise ValueError("纵轴范围必须在 0 到 1 之间，且最小值小于最大值")
+    ax.set_ylim(lower, upper)
+    if lower > 0 or upper < 1:
+        ax.text(0.99, 0.02, "Y axis zoomed", transform=ax.transAxes,
+                ha="right", va="bottom", fontsize=8, color="gray")
+
+
+# 每个模型独立绘制验证集 AP；单点模型用散点显示。
+def plot_validation_ap(name, search, chosen, output, y_min=None, y_max=None):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    xs = [item["n_estimators"] for item in search if "n_estimators" in item]
+    ys = [item["pr_auc"] for item in search]
+    if xs:
         ax.plot(xs, ys, marker="o" if name == "random-forest" else None,
-                markersize=4, label=label)
-        chosen = best_by_family[name]
-        chosen_ap = (ys[chosen["n_estimators"] - 1] if name == "xgboost"
-                     else chosen["pr_auc"])
-        ax.scatter(chosen["n_estimators"], chosen_ap, s=90,
-                   facecolors="none", edgecolors="black", linewidths=1.5,
-                   zorder=3, label="Selected")
-        ax.axhline(baseline, color="gray", linestyle="--",
-                   label="Logistic regression")
+                markersize=4, label="Validation AP")
+        best_x = chosen["n_estimators"]
+        ax.scatter(best_x, ys[xs.index(best_x)], s=90, facecolors="none",
+                   edgecolors="black", linewidths=1.5, zorder=3,
+                   label=f"Selected: {best_x}")
         ax.set_xlim(0, max(xs) * 1.04)
-        ax.set_ylim(0, 1)
         ax.set_xlabel("Number of trees" if name == "random-forest"
                       else "Boosting round")
-        ax.set_title(label)
-        ax.grid(alpha=0.25)
-        ax.legend(fontsize=8)
-    axes[0].set_xticks(RF_COUNTS)
-    axes[0].set_ylabel("Validation AP")
+        if name == "random-forest":
+            ax.set_xticks(xs)
+    else:
+        ax.scatter([1], ys, label=f"Validation AP: {ys[0]:.4f}")
+        ax.set_xlim(0.5, 1.5)
+        ax.set_xticks([1], ["Logistic regression"])
+    set_score_axis(ax, ys, y_min, y_max)
+    ax.set_ylabel("Validation AP")
+    ax.set_title(f"{name} - Validation AP")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8)
     fig.tight_layout()
-    fig.savefig(MODEL_DIR / "validation-ap-by-estimators.png", dpi=180)
+    fig.savefig(output, dpi=180)
     plt.close(fig)
+    print(f"[绘图] AP: {output}", flush=True)
 
 
-# 使用验证集每个不同的预测概率对应的阈值绘制 F1 曲线。
-def plot_validation_f1(y_true, y_prob, selected_threshold):
+# 对 F2 曲线抽稀，保证自动生成的图像清晰。
+def f2_plot_data(y_true, y_prob, selected_threshold):
     precision, recall, thresholds = precision_recall_curve(y_true, y_prob)
     p, r = precision[:-1], recall[:-1]
-    scores = np.divide(2 * p * r, p + r,
-                       out=np.zeros_like(p), where=(p + r) > 0)
-    best_index = np.searchsorted(thresholds, selected_threshold)
-    # 点数过多时仅为作图抽稀；最佳阈值点始终保留。
+    beta_squared = F_BETA ** 2
+    scores = np.divide(
+        (1 + beta_squared) * p * r, beta_squared * p + r,
+        out=np.zeros_like(p), where=(beta_squared * p + r) > 0,
+    )
+    best_index = int(np.searchsorted(thresholds, selected_threshold))
     step = max(1, len(thresholds) // 2000)
     shown = np.unique(np.r_[np.arange(0, len(thresholds), step),
                             best_index, len(thresholds) - 1])
+    return {
+        "thresholds": thresholds[shown].tolist(),
+        "scores": scores[shown].tolist(),
+        "selected_threshold": selected_threshold,
+        "selected_f2": float(scores[best_index]),
+    }
+
+
+# 根据验证集曲线绘制 F2 图。
+def plot_validation_f2(data, output, y_min=None, y_max=None):
+    thresholds = data["thresholds"]
+    scores = data["scores"]
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(thresholds[shown], scores[shown], label="Validation F1")
-    ax.scatter(selected_threshold, scores[best_index], color="tab:orange",
-               zorder=3, label=f"Selected: {selected_threshold:.4f}")
+    ax.plot(thresholds, scores, label="Validation F2")
+    ax.scatter(data["selected_threshold"], data["selected_f2"],
+               color="tab:orange", zorder=3,
+               label=f"Selected: {data['selected_threshold']:.4f}")
     ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
+    set_score_axis(ax, scores, y_min, y_max)
     ax.set_xlabel("Classification threshold")
-    ax.set_ylabel("Validation F1")
-    ax.set_title("Validation F1 by threshold")
+    ax.set_ylabel("Validation F2")
+    ax.set_title("Validation F2 by threshold")
     ax.grid(alpha=0.25)
     ax.legend()
     fig.tight_layout()
-    fig.savefig(MODEL_DIR / "validation-f1-by-threshold.png", dpi=180)
+    fig.savefig(output, dpi=180)
     plt.close(fig)
+    print(f"[绘图] F2: {output}", flush=True)
 
 
-def main_select():
-    # 第一阶段仅用训练集与验证集确定模型、树数/轮数和阈值。
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    print("[select] 开始读取标准化数据", flush=True)
-    df, metadata = load_training_data()
-    parts = split_by_time(df)
-    print(
-        f"[select] 已按时间划分：训练集 {len(parts['train']):,} 行，"
-        f"验证集 {len(parts['validation']):,} 行",
-        flush=True,
+# 图和指标都按模型命名，避免不同实验互相覆盖。
+def model_path(name):
+    return MODEL_DIR / f"{name}.pkl"
+
+
+def metrics_path(name):
+    return MODEL_DIR / f"{name}-metrics.json"
+
+
+def draw_charts(name, trials, curve, chosen, y_min=None, y_max=None):
+    plot_validation_ap(
+        name, trials, chosen,
+        MODEL_DIR / f"validation-ap-{name}.png", y_min, y_max,
     )
-    # 只记录训练集和验证集统计，测试集留到最终评估阶段。
-    metadata["splits"] = {
-        name: {
-            "rows": len(parts[name]),
-            "risk_rows": int(parts[name]["is_laundering"].sum()),
-            "start": parts[name]["transaction_timestamp"].min().isoformat(),
-            "end": parts[name]["transaction_timestamp"].max().isoformat(),
-        }
-        for name in ("train", "validation")
-    }
-    # X 保存九列输入特征，y 保存真实标签：正常为 0，风险为 1。
-    X_train = build_features(parts["train"])
-    y_train = parts["train"]["is_laundering"].astype(int)
-    X_val = build_features(parts["validation"])
-    y_val = parts["validation"]["is_laundering"].astype(int).to_numpy()
-    print("[select] 特征构建完成，开始比较候选模型", flush=True)
+    plot_validation_f2(
+        curve, MODEL_DIR / f"validation-f2-{name}.png", y_min, y_max,
+    )
 
-    # 逻辑回归作为基线；随机森林比较预设的候选树数。
-    candidate_counts = {
-        "logistic-regression": [None],
-        "random-forest": RF_COUNTS,
-    }
-    all_metrics = {}
-    parameter_search = {}
-    X_train_values = X_train[FEATURE_NAMES]
-    X_val_values = X_val[FEATURE_NAMES]
 
-    for name, counts in candidate_counts.items():
-        trials = []
-        best_result = None
-        for count in counts:
-            model_label = "逻辑回归" if name == "logistic-regression" else f"随机森林（{count} 棵树）"
-            print(f"[select] 开始训练 {model_label}", flush=True)
-            if name == "logistic-regression":
-                model = make_pipeline(
-                    StandardScaler(),
-                    LogisticRegression(max_iter=500, class_weight="balanced"),
-                )
-            else:
-                model = RandomForestClassifier(
-                    n_estimators=count, random_state=SEED,
-                    class_weight="balanced", n_jobs=-1,
-                )
-            model.fit(X_train_values, y_train)
-            probability = model.predict_proba(X_val_values)[:, 1]
-            result = {
-                "positive_rate": float(y_val.mean()),
-                "roc_auc": float(roc_auc_score(y_val, probability)),
-                "pr_auc": float(average_precision_score(y_val, probability)),
-                "features": FEATURE_NAMES,
-            }
-            if count is not None:
-                result["n_estimators"] = count
-            trials.append(result)
-            print(
-                f"[select] {model_label} 完成，验证集 AP={result['pr_auc']:.4f}",
-                flush=True,
-            )
-            # AP 并列时不更新，保留较少的树数。
-            if best_result is None or result["pr_auc"] > best_result["pr_auc"]:
-                best_result = result
-                joblib.dump(model, MODEL_DIR / f"{name}.pkl")
-        parameter_search[name] = trials
-        all_metrics[name] = best_result
-
-    # XGBoost 训练到搜索上限，每轮均在同一验证集计算 AP。
-    print(f"[select] 开始训练 XGBoost，共 {XGB_MAX_ROUNDS} 轮；每 50 轮输出一次验证结果", flush=True)
-    xgb_params = dict(max_depth=5, learning_rate=0.08,
-                      subsample=0.9, colsample_bytree=0.9, random_state=SEED)
-    search_model = XGBClassifier(n_estimators=XGB_MAX_ROUNDS,
-                                 eval_metric=validation_ap, **xgb_params)
-    search_model.fit(X_train_values, y_train,
-                     eval_set=[(X_val_values, y_val)], verbose=50)
-    ap_history = search_model.evals_result()["validation_0"]["validation_ap"]
-    if len(ap_history) != XGB_MAX_ROUNDS or not np.isfinite(ap_history).all():
-        raise ValueError("XGBoost 逐轮验证指标缺失或无效")
-    # 并列时取第一个最大值，即较少的轮数。
-    best_round = int(np.argmax(ap_history)) + 1
-    print(f"[select] XGBoost 搜索完成，最佳轮数为 {best_round}；正在按该轮数重新训练", flush=True)
-    parameter_search["xgboost"] = [
-        {"n_estimators": i, "pr_auc": float(ap)}
-        for i, ap in enumerate(ap_history, start=1)
-    ]
-    # 将最佳轮数重新训练并保存，部署预测也只使用选中的轮数。
-    xgb_model = XGBClassifier(n_estimators=best_round,
-                              eval_metric="logloss", **xgb_params)
-    xgb_model.fit(X_train_values, y_train)
-    xgb_prob = xgb_model.predict_proba(X_val_values)[:, 1]
-    all_metrics["xgboost"] = {
-        "n_estimators": best_round,
+def model_result(y_val, probability, rounds=None):
+    result = {
         "positive_rate": float(y_val.mean()),
-        "roc_auc": float(roc_auc_score(y_val, xgb_prob)),
-        "pr_auc": float(average_precision_score(y_val, xgb_prob)),
+        "roc_auc": float(roc_auc_score(y_val, probability)),
+        "pr_auc": float(average_precision_score(y_val, probability)),
         "features": FEATURE_NAMES,
     }
-    joblib.dump(xgb_model, MODEL_DIR / "xgboost.pkl")
-    print(f"[select] XGBoost 训练完成，验证集 AP={all_metrics['xgboost']['pr_auc']:.4f}", flush=True)
+    if rounds is not None:
+        result["n_estimators"] = rounds
+    return result
 
-    # 每种模型先选出最佳配置，再比较三个模型的验证集 AP。
-    print("[select] 正在比较三个模型并选择最终模型", flush=True)
-    plot_validation_ap(parameter_search, all_metrics)
-    best_name = max(all_metrics, key=lambda name: all_metrics[name]["pr_auc"])
-    best_model = joblib.load(MODEL_DIR / f"{best_name}.pkl")
-    joblib.dump(best_model, MODEL_DIR / "model.pkl")
 
-    # 只对选中的模型搜索阈值，使用验证集概率，不重新训练模型。
-    validation_probability = best_model.predict_proba(X_val[FEATURE_NAMES])[:, 1]
-    selected_threshold, candidate_count = select_threshold(y_val, validation_probability)
-    print(f"[select] 已选模型：{best_name}；正在选择分类阈值", flush=True)
-    plot_validation_f1(y_val, validation_probability, selected_threshold)
-    validation_selected = metrics(y_val, validation_probability, selected_threshold)
+# 逻辑回归仅训练一次，rounds 为最大迭代次数。
+def train_logistic(X_train, y_train, X_val, y_val, rounds):
+    print(f"[训练] 逻辑回归：最大迭代 {rounds} 次", flush=True)
+    model = make_pipeline(StandardScaler(),
+                          LogisticRegression(max_iter=rounds,
+                                             class_weight="balanced"))
+    model.fit(X_train, y_train)
+    probability = model.predict_proba(X_val)[:, 1]
+    result = model_result(y_val, probability)
+    joblib.dump(model, model_path("logistic-regression"))
+    print(f"[训练] 逻辑回归完成，验证集 AP={result['pr_auc']:.6f}", flush=True)
+    return result, [result], probability
 
-    # 记录模型文件摘要，最终评估时核对是否仍为选中的模型。
-    with (MODEL_DIR / "model.pkl").open("rb") as stream:
+
+# 随机森林比较不超过 rounds 的候选树数，保留 AP 最好的模型。
+def train_random_forest(X_train, y_train, X_val, y_val, rounds):
+    counts = sorted(set([n for n in RF_COUNTS if n <= rounds] + [rounds]))
+    best = None
+    best_probability = None
+    trials = []
+    for count in counts:
+        print(f"[训练] 随机森林：{count} 棵树", flush=True)
+        model = RandomForestClassifier(
+            n_estimators=count, random_state=SEED,
+            class_weight="balanced", n_jobs=-1,
+        )
+        model.fit(X_train, y_train)
+        probability = model.predict_proba(X_val)[:, 1]
+        result = model_result(y_val, probability, count)
+        trials.append(result)
+        print(f"[训练] {count} 棵树，验证集 AP={result['pr_auc']:.6f}", flush=True)
+        if best is None or result["pr_auc"] > best["pr_auc"]:
+            best = result
+            best_probability = probability
+            joblib.dump(model, model_path("random-forest"))
+    print(f"[训练] 随机森林完成，最佳树数={best['n_estimators']}", flush=True)
+    return best, trials, best_probability
+
+
+# XGBoost 按验证集逐轮 AP 选轮数，再按选中轮数重新训练。
+def train_xgboost(X_train, y_train, X_val, y_val, rounds):
+    print(f"[训练] XGBoost：最多 {rounds} 轮，每 50 轮输出验证指标", flush=True)
+    params = dict(max_depth=5, learning_rate=0.08,
+                  subsample=0.9, colsample_bytree=0.9, random_state=SEED)
+    search = XGBClassifier(n_estimators=rounds,
+                           eval_metric=validation_ap, **params)
+    search.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=50)
+    history = search.evals_result()["validation_0"]["validation_ap"]
+    if len(history) != rounds or not np.isfinite(history).all():
+        raise ValueError("XGBoost 逐轮验证指标缺失或无效")
+    best_round = int(np.argmax(history)) + 1
+    trials = [{"n_estimators": i, "pr_auc": float(ap)}
+              for i, ap in enumerate(history, start=1)]
+    print(f"[训练] 最高逐轮 AP={history[best_round-1]:.6f}，第 {best_round} 轮；重新训练", flush=True)
+    del search
+    model = XGBClassifier(n_estimators=best_round,
+                          eval_metric="logloss", **params)
+    model.fit(X_train, y_train)
+    probability = model.predict_proba(X_val)[:, 1]
+    result = model_result(y_val, probability, best_round)
+    joblib.dump(model, model_path("xgboost"))
+    print(f"[训练] XGBoost 完成，验证集 AP={result['pr_auc']:.6f}", flush=True)
+    return result, trials, probability
+
+
+TRAINERS = {
+    "logistic-regression": train_logistic,
+    "random-forest": train_random_forest,
+    "xgboost": train_xgboost,
+}
+
+
+# 选择阶段只训练指定模型，阈值仅由验证集决定。
+def main_select(name, rounds, y_min=None, y_max=None):
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"[select] 模型={name}，轮数上限={rounds}", flush=True)
+    df, metadata = load_training_data()
+    parts = split_by_time(df)
+    print(f"[select] 训练集 {len(parts['train']):,} 行；验证集 {len(parts['validation']):,} 行", flush=True)
+    metadata["splits"] = {
+        key: {
+            "rows": len(parts[key]),
+            "risk_rows": int(parts[key]["is_laundering"].sum()),
+            "start": parts[key]["transaction_timestamp"].min().isoformat(),
+            "end": parts[key]["transaction_timestamp"].max().isoformat(),
+        }
+        for key in ("train", "validation")
+    }
+    X_train = build_features(parts["train"])[FEATURE_NAMES]
+    y_train = parts["train"]["is_laundering"].astype(int)
+    X_val = build_features(parts["validation"])[FEATURE_NAMES]
+    y_val = parts["validation"]["is_laundering"].astype(int).to_numpy()
+    print("[select] 特征构建完成", flush=True)
+
+    chosen, trials, probability = TRAINERS[name](
+        X_train, y_train, X_val, y_val, rounds,
+    )
+    threshold, candidate_count = select_threshold(y_val, probability)
+    validation_selected = metrics(y_val, probability, threshold)
+    print(f"[select] F2 阈值={threshold:.6f}；验证集 F2={validation_selected['f2']:.6f}", flush=True)
+
+    # 模型专属文件用于独立测试；根目录 model.pkl 保持部署入口不变。
+    with model_path(name).open("rb") as stream:
         model_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
-
-    # 先保存验证集选择结果；此阶段不计算测试集指标。
     output = {
-        "best_model": best_name,
+        "best_model": name,
         "model_sha256": model_sha256,
-        "selection_metric": "validation average precision (pr_auc field)",
-        "models": all_metrics,
-        "parameter_search": parameter_search,
+        "selection_metric": "model chosen by CLI; rounds selected by validation AP",
+        "models": {name: chosen},
+        "parameter_search": {name: trials},
+        "training_config": {"model": name, "rounds": rounds},
         "threshold_selection": {
             "dataset": "validation",
-            "metric": "f1",
+            "metric": "f2",
             "candidate_rule": "unique validation predicted probabilities",
             "candidate_count": candidate_count,
-            "tie_break": "highest threshold among equal maximum F1 scores",
-            "selected_threshold": selected_threshold,
+            "tie_break": "highest threshold among equal maximum F2 scores",
+            "selected_threshold": threshold,
             "validation_selected": validation_selected,
         },
         "data": metadata,
-        # 记录训练环境，用于核对部署依赖和复现实验。
         "environment": {
             "python": platform.python_version(),
             "packages": {
-                name: version(name) for name in
+                package: version(package) for package in
                 ["scikit-learn", "xgboost", "numpy", "scipy", "joblib", "pandas", "pyarrow", "matplotlib"]
             },
         },
     }
-    # 将评估结果写入 JSON，保留中文并缩进排版。
+    metrics_path(name).write_text(
+        json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    curve = f2_plot_data(y_val, probability, threshold)
+    draw_charts(name, trials, curve, chosen, y_min, y_max)
+    print("[select] 正在更新部署模型", flush=True)
+    shutil.copyfile(model_path(name), MODEL_DIR / "model.pkl")
     (MODEL_DIR / "metrics.json").write_text(
         json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8",
     )
-    print("[select] 验证集选择完成，结果和图像已保存", flush=True)
-    print("best_model:", best_name)
-    print("selected_threshold:", selected_threshold)
-    print("验证集结果已保存；确认候选范围后再运行 test。")
+    print(f"[select] 完成：{metrics_path(name)}", flush=True)
+    print("[select] 测试集尚未评估；运行 test --model 后查看", flush=True)
 
 
-# 第二阶段只加载已选好的模型和阈值，评估一次测试集。
-def main_test():
-    result_path = MODEL_DIR / "metrics.json"
-    if not result_path.is_file() or not (MODEL_DIR / "model.pkl").is_file():
-        raise FileNotFoundError("请先运行 select，生成模型和验证集记录")
-    print("[test] 开始加载模型并准备测试集", flush=True)
+# 测试阶段只读取对应模型的选择记录，不重新训练或调整阈值。
+def main_test(name):
+    result_path = metrics_path(name)
+    trained_path = model_path(name)
+    if not result_path.is_file() or not trained_path.is_file():
+        raise FileNotFoundError(f"请先运行 select --model {name}")
     result = json.loads(result_path.read_text(encoding="utf-8"))
+    if result["best_model"] != name:
+        raise ValueError("模型与选择记录不一致")
     if "test" in result:
         raise ValueError("测试集已评估；不要用测试结果反复调整参数")
-    with (MODEL_DIR / "model.pkl").open("rb") as stream:
+    print(f"[test] 正在核对 {name} 模型文件", flush=True)
+    with trained_path.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     if digest != result["model_sha256"]:
         raise ValueError("模型文件与验证集选择记录不一致，请重新运行 select")
@@ -421,22 +474,21 @@ def main_test():
     previous_splits = previous.pop("splits")
     if metadata != previous:
         raise ValueError("数据来源或筛选条件发生变化，请重新运行 select")
-    for name in ("train", "validation"):
-        part = parts[name]
-        saved = previous_splits[name]
+    for key in ("train", "validation"):
+        part = parts[key]
+        saved = previous_splits[key]
         if (len(part) != saved["rows"] or
                 part["transaction_timestamp"].min().isoformat() != saved["start"] or
                 part["transaction_timestamp"].max().isoformat() != saved["end"]):
             raise ValueError("数据划分发生变化，请重新运行 select")
 
-    # 不再重新训练或选阈值；只用已有模型预测测试集。
-    best_model = joblib.load(MODEL_DIR / "model.pkl")
+    model = joblib.load(trained_path)
     threshold = result["threshold_selection"]["selected_threshold"]
     test = parts["test"]
     X_test = build_features(test)
     y_test = test["is_laundering"].astype(int).to_numpy()
-    print(f"[test] 开始预测测试集，共 {len(test):,} 行", flush=True)
-    probability = best_model.predict_proba(X_test[FEATURE_NAMES])[:, 1]
+    print(f"[test] 正在预测 {len(test):,} 行", flush=True)
+    probability = model.predict_proba(X_test[FEATURE_NAMES])[:, 1]
     result["test"] = metrics(y_test, probability, threshold)
     result["data"]["splits"]["test"] = {
         "rows": len(test),
@@ -446,16 +498,91 @@ def main_test():
     }
     result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2),
                            encoding="utf-8")
-    print("[test] 测试集评估完成，结果已写入 metrics.json", flush=True)
-    print("test:", result["test"])
+    # 根目录指标仅在当前部署模型与本次测试模型相同时同步。
+    root_path = MODEL_DIR / "metrics.json"
+    if root_path.is_file():
+        root = json.loads(root_path.read_text(encoding="utf-8"))
+        if root.get("model_sha256") == digest and root.get("best_model") == name:
+            root_path.write_text(json.dumps(result, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+    print(f"[test] 完成：{result_path}", flush=True)
+    print("[test] 指标:", result["test"], flush=True)
 
 
-# 显式指定阶段，避免选型时提前查看测试结果。
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("stage", choices=["select", "test"])
+# 比较已保存的验证集 AP，不重新训练，也不使用测试集。
+def main_compare(y_min=None, y_max=None):
+    names = list(TRAINERS)
+    results = []
+    for name in names:
+        file = metrics_path(name)
+        if not file.is_file():
+            raise FileNotFoundError(f"缺少 {file}；请先训练三个模型")
+        results.append(json.loads(file.read_text(encoding="utf-8")))
+    def comparable_data(result):
+        data = dict(result["data"])
+        splits = dict(data.pop("splits"))
+        splits.pop("test", None)
+        return data, splits
+    if any(comparable_data(result) != comparable_data(results[0]) for result in results[1:]):
+        raise ValueError("三个模型的数据来源或划分不同，不能直接比较")
+    scores = [result["models"][name]["pr_auc"]
+              for name, result in zip(names, results)]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    xs = np.arange(len(names))
+    ax.scatter(xs, scores, s=90, color="tab:blue")
+    ax.set_xlim(-0.5, len(names) - 0.5)
+    ax.set_xticks(xs, names)
+    set_score_axis(ax, scores, y_min, y_max)
+    ax.set_ylabel("Validation AP")
+    ax.set_title("Validation AP by model")
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    output = MODEL_DIR / "validation-ap-model-comparison.png"
+    fig.savefig(output, dpi=180)
+    plt.close(fig)
+    for name, score in zip(names, scores):
+        print(f"[比较] {name}: AP={score:.6f}", flush=True)
+    print(f"[比较] 最佳验证集 AP：{names[int(np.argmax(scores))]}", flush=True)
+    print(f"[比较] 图像：{output}", flush=True)
+
+
+# 训练和测试均需指定模型，比较只读取保存的验证集指标。
+def positive_int(value):
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("轮数必须为正整数")
+    return number
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="按模型独立训练、测试和比较；训练后自动生成图像")
+    stages = parser.add_subparsers(dest="stage", required=True)
+    for stage in ("select", "test", "compare"):
+        sub = stages.add_parser(stage)
+        if stage != "compare":
+            sub.add_argument("--model", required=True, choices=TRAINERS)
+        if stage == "select":
+            sub.add_argument("--rounds", type=positive_int,
+                             help="逻辑回归最大迭代数、随机森林最大树数或 XGBoost 最大轮数")
+        if stage != "test":
+            sub.add_argument("--y-min", type=float, help="图的纵轴最小值；默认自动缩放")
+            sub.add_argument("--y-max", type=float, help="图的纵轴最大值；默认自动缩放")
     args = parser.parse_args()
+    if args.stage != "test":
+        for bound in (args.y_min, args.y_max):
+            if bound is not None and (not np.isfinite(bound) or not 0 <= bound <= 1):
+                parser.error("纵轴边界必须是 0 到 1 之间的有限数")
+        if args.y_min is not None and args.y_max is not None and args.y_min >= args.y_max:
+            parser.error("纵轴最小值必须小于最大值")
+    return args
+
+
+if __name__ == "__main__":
+    args = parse_args()
     if args.stage == "select":
-        main_select()
+        main_select(args.model, args.rounds or DEFAULT_ROUNDS[args.model],
+                    args.y_min, args.y_max)
+    elif args.stage == "test":
+        main_test(args.model)
     else:
-        main_test()
+        main_compare(args.y_min, args.y_max)
